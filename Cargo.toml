@@ -1,0 +1,24 @@
+[package]
+name = "atmega-usbd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+avr-device = { version = "0.5", features = ["atmega32u4"] }
+usb-device = "0.3"
+
+[dev-dependencies]
+usbd-hid = "0.7"
+
+[dev-dependencies.arduino-hal]
+git = "https://github.com/Rahix/avr-hal.git"
+branch = "main"
+features = ["arduino-leonardo"]
+
+[profile.dev]
+opt-level = "s"
+lto = true
+
+[profile.release]
+opt-level = "s"
+lto = true
