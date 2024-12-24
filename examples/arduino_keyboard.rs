@@ -10,13 +10,10 @@
 //! 3. Make sure [Ravedude](https://github.com/Rahix/avr-hal/tree/main/ravedude)
 //! is installed. Then "run" the example to deploy it to the Arduino:
 //!
-//!   ```
+//!   ```
 //!   cargo run --release --example arduino_keyboard
 //!   ```
-//!   
-//! 4. Open Notepad (or whatever editor or text input of your choosing). Press
-//! the button (or if you are not using one, short D2 to GND with a jumper). You
-//! should see it type "Hello World"
+//!   
 
 #![no_std]
 #![cfg_attr(not(test), no_main)]
@@ -26,17 +23,23 @@
 
 mod std_stub;
 
+use layers::Layers;
+use matrix::Matrix;
+use usb_keyboard::UsbKeyboard;
+use keyboard_config::{MATRIX_COLS, MATRIX_ROWS};
+
 use arduino_hal::{
     entry,
-    pac::PLL,
+    pac::{self, PLL},
     pins,
     port::{
-        mode::{Input, Output, PullUp},
+        mode::Output,
         Pin,
     },
+    prelude::*,
     Peripherals,
 };
-use atmega_usbd::{SuspendNotifier, UsbBus};
+use atmega_usbd::{keyboard_config, layers, matrix, usb_keyboard, SuspendNotifier, UsbBus};
 use avr_device::{asm::sleep, interrupt};
 use usb_device::{
     class_prelude::UsbBusAllocator,
@@ -49,17 +52,12 @@ use usbd_hid::{
     hid_class::HIDClass,
 };
 
-const PAYLOAD: &[u8] = b"Hello World";
-
 #[entry]
 fn main() -> ! {
     let dp = Peripherals::take().unwrap();
     let pins = pins!(dp);
     let pll = dp.PLL;
     let usb = dp.USB_DEVICE;
-
-    let status = pins.d13.into_output();
-    let trigger = pins.d2.into_pull_up_input();
 
     // Configure PLL interface
     // prescale 16MHz crystal -> 8MHz
@@ -89,122 +87,84 @@ fn main() -> ! {
         .unwrap()
         .build();
 
+    let mut matrix = Matrix::new(pins);
+    let mut layers = Layers::new(); // Initialize with default keymaps
+    
+    // Define a pin for the status LED
+    // let status_led = pins.d13.into_output().downgrade();
+
+    let usb_keyboard = UsbKeyboard::new(usb_device, hid_class); // Pass the usb allocator to your keyboard class
+
     unsafe {
-        USB_CTX = Some(UsbContext {
-            usb_device,
-            hid_class,
-            current_index: 0,
-            pressed: false,
-            indicator: status.downgrade(),
-            trigger: trigger.downgrade(),
-        });
+        USB_CTX = Some(usb_keyboard);
+        MATRIX_CTX = Some(matrix);
+        LAYERS_CTX = Some(layers);
     }
 
-    unsafe { interrupt::enable() };
+    // Timer interrupt setup (example using Timer1)
+    unsafe {
+        // Configure Timer1 for regular scanning (adjust prescaler and compare value as needed)
+        // Access Timer1 through the TC1 constant
+        (*pac::TC1::ptr())
+            .tccr1a
+            .write(|w| w.wgm1().bits(0b00)); // WGM11 and WGM10 = 0
+        (*pac::TC1::ptr())
+            .tccr1b
+            .write(|w| w.cs1().prescale_64().wgm1().bits(0b01)); // CS1=prescale_64, WGM13 and WGM12 = 0b01 (CTC mode with OCR1A as TOP)
+        (*pac::TC1::ptr()).ocr1a.write(|w| w.bits(1000)); // Example: 1kHz scanning (adjust for desired rate)
+        (*pac::TC1::ptr()).timsk1.write(|w| w.ocie1a().set_bit());
+
+        interrupt::enable();
+    }
+
     loop {
-        sleep();
+        sleep(); // Sleep until an interrupt occurs
     }
 }
 
-static mut USB_CTX: Option<UsbContext<PLL>> = None;
+static mut USB_CTX: Option<UsbKeyboard<UsbBus<PLL>>> = None;
+static mut MATRIX_CTX: Option<Matrix> = None;
+static mut LAYERS_CTX: Option<Layers> = None;
 
 #[interrupt(atmega32u4)]
 fn USB_GEN() {
-    unsafe { poll_usb() };
+    unsafe {
+        if let Some(usb_keyboard) = &mut USB_CTX {
+            usb_keyboard.poll();
+        }
+    }
 }
 
 #[interrupt(atmega32u4)]
 fn USB_COM() {
-    unsafe { poll_usb() };
-}
-
-/// # Safety
-///
-/// This function assumes that it is being called within an
-/// interrupt context.
-unsafe fn poll_usb() {
-    // Safety: There must be no other overlapping borrows of USB_CTX.
-    // - By the safety contract of this function, we are in an interrupt
-    //   context.
-    // - The main thread is not borrowing USB_CTX. The only access is the
-    //   assignment during initialization. It cannot overlap because it is
-    //   before the call to `interrupt::enable()`.
-    // - No other interrupts are accessing USB_CTX, because no other interrupts
-    //   are in the middle of execution. GIE is automatically cleared for the
-    //   duration of the interrupt, and is not re-enabled within any ISRs.
-    let ctx = unsafe { USB_CTX.as_mut().unwrap() };
-    ctx.poll();
-}
-
-struct UsbContext<S: SuspendNotifier> {
-    usb_device: UsbDevice<'static, UsbBus<S>>,
-    hid_class: HIDClass<'static, UsbBus<S>>,
-    current_index: usize,
-    pressed: bool,
-    indicator: Pin<Output>,
-    trigger: Pin<Input<PullUp>>,
-}
-
-impl<S: SuspendNotifier> UsbContext<S> {
-    fn poll(&mut self) {
-        if self.trigger.is_low() {
-            let next_report = if self.pressed {
-                BLANK_REPORT
-            } else {
-                PAYLOAD
-                    .get(self.current_index)
-                    .copied()
-                    .and_then(ascii_to_report)
-                    .unwrap_or(BLANK_REPORT)
-            };
-
-            if self.hid_class.push_input(&next_report).is_ok() {
-                if self.pressed && self.current_index < PAYLOAD.len() {
-                    self.current_index += 1;
-                }
-                self.pressed = !self.pressed;
-            }
-        } else {
-            self.current_index = 0;
-            self.pressed = false;
-            self.hid_class.push_input(&BLANK_REPORT).ok();
-        }
-
-        if self.usb_device.poll(&mut [&mut self.hid_class]) {
-            let mut report_buf = [0u8; 1];
-
-            if self.hid_class.pull_raw_output(&mut report_buf).is_ok() {
-                if report_buf[0] & 2 != 0 {
-                    self.indicator.set_high();
-                } else {
-                    self.indicator.set_low();
-                }
-            }
+    unsafe {
+        if let Some(usb_keyboard) = &mut USB_CTX {
+            usb_keyboard.poll();
         }
     }
 }
 
-const BLANK_REPORT: KeyboardReport = KeyboardReport {
-    modifier: 0,
-    reserved: 0,
-    leds: 0,
-    keycodes: [0; 6],
-};
-
-fn ascii_to_report(c: u8) -> Option<KeyboardReport> {
-    let (keycode, shift) = if c.is_ascii_alphabetic() {
-        (c.to_ascii_lowercase() - b'a' + 0x04, c.is_ascii_uppercase())
-    } else {
-        match c {
-            b' ' => (0x2c, false),
-            _ => return None,
+// Timer1 Compare A interrupt
+#[interrupt(atmega32u4)]
+fn TIMER1_COMPA() {
+    unsafe {
+        if let Some(usb_keyboard) = &mut USB_CTX {
+            if let Some(matrix) = &mut MATRIX_CTX {
+                if let Some(layers) = &mut LAYERS_CTX {
+                    let new_state = matrix.scan();
+                    let layer = layers.get_current_layer();
+                    for row in 0..MATRIX_ROWS {
+                        for col in 0..MATRIX_COLS {
+                            if new_state[row][col] != matrix.last_state[row][col] {
+                                let keycode = layers.get_keycode(layer, row, col);
+                                let is_pressed = new_state[row][col];
+                                usb_keyboard.handle_keypress(keycode, is_pressed);
+                            }
+                        }
+                    }
+                    matrix.last_state = new_state;
+                }
+            }
         }
-    };
-
-    let mut report = BLANK_REPORT;
-    if shift {
-        report.modifier |= 0x2;
     }
-    report.keycodes[0] = keycode;
-    Some(report)
 }

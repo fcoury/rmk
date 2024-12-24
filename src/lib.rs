@@ -1,6 +1,13 @@
 #![no_std]
 #![feature(asm_experimental_arch)]
 
+pub mod usb_keyboard;
+pub mod layers;
+pub mod keycodes;
+pub mod keyboard_config;
+pub mod usb_descriptors;
+pub mod matrix;
+
 use core::{arch::asm, cell::Cell, cmp::max};
 
 use avr_device::atmega32u4::{
